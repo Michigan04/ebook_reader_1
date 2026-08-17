@@ -2,14 +2,14 @@ import json
 import io
 import re
 from typing import Optional, Tuple
-from fastapi import FastAPI, HTTPException, Response, Request
+from fastapi import FastAPI, HTTPException, Response, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from gtts import gTTS
 from google import genai
 
 app = FastAPI(
     title="gTTS + Gemini Robust Preprocessor API",
-    version="1.3.0"
+    version="1.3.1"
 )
 
 app.add_middleware(
@@ -21,50 +21,44 @@ app.add_middleware(
 
 def extract_raw_fields(raw_body: str) -> Tuple[str, Optional[str], str, bool]:
     """
-    Extracts fields directly using regex so messy, unescaped strings 
+    Extracts parameters directly using regex so messy, unescaped strings 
     with raw newlines/control chars won't fail standard JSON parsers.
     """
-    # Extract "text": "..." handling multiline contents safely
-    text_match = re.search(r'"text"\s*:\s*"(.*?)"\s*,\s*"gemini_api_key"', raw_body, re.DOTALL)
+    # Try standard json parse first if user provided valid JSON
+    try:
+        clean_json = raw_body.replace('\r\n', '\\n').replace('\n', '\\n').replace('\t', '\\t')
+        parsed = json.loads(clean_json)
+        return (
+            parsed.get("text", ""),
+            parsed.get("gemini_api_key", None),
+            parsed.get("lang", "en"),
+            bool(parsed.get("slow", False))
+        )
+    except Exception:
+        pass
+
+    # Fallback to Regex pattern matching for malformed/pasted JSON strings
+    text_match = re.search(r'"text"\s*:\s*"(.*?)"\s*,\s*"', raw_body, re.DOTALL)
     if not text_match:
-        # Fallback regex if gemini_api_key isn't the immediate next key
-        text_match = re.search(r'"text"\s*:\s*"(.*?)"\s*,\s*"[a-zA-Z_]+"', raw_body, re.DOTALL)
+        text_match = re.search(r'"text"\s*:\s*"(.*)"', raw_body, re.DOTALL)
     
     raw_text = text_match.group(1) if text_match else ""
 
-    # Extract optional Gemini API Key
     key_match = re.search(r'"gemini_api_key"\s*:\s*"(.*?)"', raw_body)
     gemini_key = key_match.group(1) if key_match and key_match.group(1).strip() else None
 
-    # Extract language parameter
     lang_match = re.search(r'"lang"\s*:\s*"(.*?)"', raw_body)
     lang = lang_match.group(1) if lang_match else "en"
 
-    # Extract slow parameter
     slow_match = re.search(r'"slow"\s*:\s*(true|false)', raw_body, re.IGNORECASE)
     slow = slow_match.group(1).lower() == "true" if slow_match else False
-
-    # Fallback to standard json.loads if regex extraction fails completely
-    if not raw_text:
-        try:
-            # Replace physical control characters with escaped equivalents
-            clean_json = raw_body.replace('\r\n', '\\n').replace('\n', '\\n').replace('\t', '\\t')
-            parsed = json.loads(clean_json)
-            raw_text = parsed.get("text", "")
-            gemini_key = parsed.get("gemini_api_key", gemini_key)
-            lang = parsed.get("lang", lang)
-            slow = parsed.get("slow", slow)
-        except Exception:
-            pass
 
     return raw_text, gemini_key, lang, slow
 
 
 def fallback_clean(raw_text: str) -> str:
     """Basic fallback cleaner if Gemini API Key is missing."""
-    # Strip escape sequences like \bu, \bur
     cleaned = re.sub(r'\\[a-zA-Z]+', '', raw_text)
-    # Collapse whitespace and newlines
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
@@ -98,7 +92,45 @@ def clean_with_gemini(raw_text: str, api_key: str) -> str:
         raise HTTPException(status_code=400, detail=f"Gemini Processing Error: {str(e)}")
 
 
-@app.post("/api/tts")
+@app.post(
+    "/api/tts",
+    summary="Convert Text to Speech",
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "Raw text to process.",
+                                "example": "To observe your mind in automatic mode...\n17 * 24"
+                            },
+                            "gemini_api_key": {
+                                "type": "string",
+                                "description": "Optional Gemini API Key for LLM text cleaning.",
+                                "example": "AIzaSy..."
+                            },
+                            "lang": {
+                                "type": "string",
+                                "default": "en",
+                                "description": "Language code.",
+                                "example": "en"
+                            },
+                            "slow": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": "Slower playback rate."
+                            }
+                        },
+                        "required": ["text"]
+                    }
+                }
+            }
+        }
+    }
+)
 async def generate_tts(request: Request):
     # Step 1: Read raw request bytes and decode safely
     raw_bytes = await request.body()
@@ -123,7 +155,7 @@ async def generate_tts(request: Request):
         if not spoken_text.strip():
             raise HTTPException(status_code=400, detail="Text resulted in an empty string after preprocessing.")
 
-        # Step 4: Feed the Gemini-processed output into gTTS
+        # Step 4: Feed Gemini's output into gTTS
         tts = gTTS(text=spoken_text, lang=lang, slow=slow)
         
         audio_buffer = io.BytesIO()
